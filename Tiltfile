@@ -107,6 +107,12 @@ stacks = cfg.get("stacks", ci)
 
 if ci:
     guardiand_loglevel = cfg.get("guardiand_loglevel", "warn")
+    # Use local k3d registry in CI to avoid pushing to Docker Hub
+    # The registry is created by k3d with --registry-create
+    default_registry(
+        'localhost:5111',
+        host_from_cluster='k3d-registry.localhost:5111'
+    )
 else:
     guardiand_loglevel = cfg.get("guardiand_loglevel", "info")
 

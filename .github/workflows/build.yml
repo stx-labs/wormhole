@@ -30,6 +30,8 @@ jobs:
     env:
       DEPLOY_NS: wormhole
       K3D_CLUSTER_NAME: ci
+      K3D_REGISTRY_NAME: k3d-registry.localhost
+      K3D_REGISTRY_PORT: "5111"
       TILT_DISABLE_ANALYTICS: "1"
 
     steps:
@@ -51,10 +53,12 @@ jobs:
           curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
           k3d version
 
-      - name: Create k3d cluster
+      - name: Create k3d cluster with local registry
         run: |
+          # Create a local registry for Tilt to push images to
           k3d cluster create $K3D_CLUSTER_NAME \
             --agents 2 \
+            --registry-create $K3D_REGISTRY_NAME:0.0.0.0:$K3D_REGISTRY_PORT \
             --k3s-arg "--disable=traefik@server:0" \
             --k3s-arg "--disable=metrics-server@server:0" \
             --wait
@@ -70,11 +74,15 @@ jobs:
           # Create the namespace
           kubectl create namespace $DEPLOY_NS
 
-      - name: Verify cluster
+      - name: Verify cluster and registry
         run: |
           kubectl cluster-info
           kubectl get nodes
           kubectl get ns
+          # Verify registry is running
+          docker ps | grep registry
+          # Test registry is accessible
+          curl -s http://localhost:$K3D_REGISTRY_PORT/v2/_catalog || echo "Registry catalog check"
 
       - name: Install Tilt
         run: |
