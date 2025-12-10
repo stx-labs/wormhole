@@ -39,6 +39,10 @@ jobs:
           kubectl config set-context ci --namespace=$DEPLOY_NS
           kubectl config use-context ci
 
+      - name: Install Tilt
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh | bash
+
       - run: tilt ci --timeout 45m0s -- --ci --namespace=$DEPLOY_NS --num=2
         timeout-minutes: 60
 
