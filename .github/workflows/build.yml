@@ -27,28 +27,86 @@ jobs:
       group: ${{ github.workflow }}-tilt-${{ github.ref }}
       cancel-in-progress: true
 
+    env:
+      DEPLOY_NS: wormhole
+      K3D_CLUSTER_NAME: ci
+      TILT_DISABLE_ANALYTICS: "1"
+
     steps:
+      - name: Free disk space
+        run: |
+          # Remove unnecessary tools to free up disk space for Docker images
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
       - name: Clear repository
         run: |
           rm -rf $GITHUB_WORKSPACE && mkdir $GITHUB_WORKSPACE
-      - uses: actions/checkout@v2
-      - name: Expand for link to Tilt dashboard (only available during build)
-        run: >
-          echo "Tilt progress dashboard: https://$DASHBOARD_URL"
-      - run: |
-          kubectl config set-context ci --namespace=$DEPLOY_NS
+
+      - uses: actions/checkout@v4
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Create k3d cluster
+        run: |
+          k3d cluster create $K3D_CLUSTER_NAME \
+            --agents 2 \
+            --k3s-arg "--disable=traefik@server:0" \
+            --k3s-arg "--disable=metrics-server@server:0" \
+            --wait
+
+      - name: Configure kubectl context
+        run: |
+          # k3d automatically merges the kubeconfig, just set the context
+          kubectl config use-context k3d-$K3D_CLUSTER_NAME
+          kubectl config set-context --current --namespace=$DEPLOY_NS
+          # Rename context to 'ci' for Tiltfile compatibility (allow_k8s_contexts("ci"))
+          kubectl config rename-context k3d-$K3D_CLUSTER_NAME ci
           kubectl config use-context ci
+          # Create the namespace
+          kubectl create namespace $DEPLOY_NS
+
+      - name: Verify cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+          kubectl get ns
 
       - name: Install Tilt
         run: |
           curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh | bash
+          tilt version
 
-      - run: tilt ci --timeout 45m0s -- --ci --namespace=$DEPLOY_NS --num=2
+      - name: Run Tilt CI
+        run: tilt ci --timeout 45m0s -- --ci --namespace=$DEPLOY_NS --num=2
         timeout-minutes: 60
 
-      # Clean up k8s resources
-      - run: kubectl delete --namespace=$DEPLOY_NS service,statefulset,configmap,pod,job --all
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== Pod Status ==="
+          kubectl get pods -n $DEPLOY_NS -o wide || true
+          echo "=== Failed Pod Logs ==="
+          for pod in $(kubectl get pods -n $DEPLOY_NS --field-selector=status.phase!=Running,status.phase!=Succeeded -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo "--- Logs for $pod ---"
+            kubectl logs -n $DEPLOY_NS "$pod" --all-containers --tail=100 || true
+          done
+          echo "=== Events ==="
+          kubectl get events -n $DEPLOY_NS --sort-by='.lastTimestamp' | tail -50 || true
+
+      - name: Cleanup k8s resources
         if: always()
+        run: |
+          kubectl delete --namespace=$DEPLOY_NS service,statefulset,configmap,pod,job --all --ignore-not-found || true
+
+      - name: Delete k3d cluster
+        if: always()
+        run: |
+          k3d cluster delete $K3D_CLUSTER_NAME || true
 
   # Verify whether the Makefile builds the node (no dependencies other than Go)
   node:
