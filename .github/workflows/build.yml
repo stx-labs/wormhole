@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - stacks-1-ci
 
 permissions:
   contents: read
@@ -15,7 +16,7 @@ jobs:
     # in the future, we may want to run cheap lints, tests, and builds before firing up the expensive tilt test.
     # But for now, we'll kick-off everything at once
     # needs: [go-lint-and-tests, node, algorand, ethereum, terra, rust-lint-and-tests]
-    runs-on: tilt-kube-public
+    runs-on: ubuntu-latest
 
     # Cancel previous builds on the same branch/ref. Full runs are expensive
     # and capacity is limited, so we want to avoid running multiple builds
@@ -26,24 +27,94 @@ jobs:
       group: ${{ github.workflow }}-tilt-${{ github.ref }}
       cancel-in-progress: true
 
+    env:
+      DEPLOY_NS: wormhole
+      K3D_CLUSTER_NAME: ci
+      K3D_REGISTRY_NAME: k3d-registry.localhost
+      K3D_REGISTRY_PORT: "5111"
+      TILT_DISABLE_ANALYTICS: "1"
+
     steps:
+      - name: Free disk space
+        run: |
+          # Remove unnecessary tools to free up disk space for Docker images
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
       - name: Clear repository
         run: |
           rm -rf $GITHUB_WORKSPACE && mkdir $GITHUB_WORKSPACE
-      - uses: actions/checkout@v2
-      - name: Expand for link to Tilt dashboard (only available during build)
-        run: >
-          echo "Tilt progress dashboard: https://$DASHBOARD_URL"
-      - run: |
-          kubectl config set-context ci --namespace=$DEPLOY_NS
-          kubectl config use-context ci
 
-      - run: tilt ci --timeout 45m0s -- --ci --namespace=$DEPLOY_NS --num=2
+      - uses: actions/checkout@v4
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Create k3d cluster with local registry
+        run: |
+          # Create a local registry for Tilt to push images to
+          k3d cluster create $K3D_CLUSTER_NAME \
+            --agents 2 \
+            --registry-create $K3D_REGISTRY_NAME:0.0.0.0:$K3D_REGISTRY_PORT \
+            --k3s-arg "--disable=traefik@server:0" \
+            --k3s-arg "--disable=metrics-server@server:0" \
+            --wait
+
+      - name: Configure kubectl context
+        run: |
+          # k3d automatically merges the kubeconfig, just set the context
+          kubectl config use-context k3d-$K3D_CLUSTER_NAME
+          kubectl config set-context --current --namespace=$DEPLOY_NS
+          # Rename context to 'ci' for Tiltfile compatibility (allow_k8s_contexts("ci"))
+          kubectl config rename-context k3d-$K3D_CLUSTER_NAME ci
+          kubectl config use-context ci
+          # Create the namespace
+          kubectl create namespace $DEPLOY_NS
+
+      - name: Verify cluster and registry
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+          kubectl get ns
+          # Verify registry is running
+          docker ps | grep registry
+          # Test registry is accessible
+          curl -s http://localhost:$K3D_REGISTRY_PORT/v2/_catalog || echo "Registry catalog check"
+
+      - name: Install Tilt
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh | bash
+          tilt version
+
+      - name: Run Tilt CI
+        run: tilt ci --timeout 45m0s -- --ci --namespace=$DEPLOY_NS --num=2
         timeout-minutes: 60
 
-      # Clean up k8s resources
-      - run: kubectl delete --namespace=$DEPLOY_NS service,statefulset,configmap,pod,job --all
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== Pod Status ==="
+          kubectl get pods -n $DEPLOY_NS -o wide || true
+          echo "=== Failed Pod Logs ==="
+          for pod in $(kubectl get pods -n $DEPLOY_NS --field-selector=status.phase!=Running,status.phase!=Succeeded -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo "--- Logs for $pod ---"
+            kubectl logs -n $DEPLOY_NS "$pod" --all-containers --tail=100 || true
+          done
+          echo "=== Events ==="
+          kubectl get events -n $DEPLOY_NS --sort-by='.lastTimestamp' | tail -50 || true
+
+      - name: Cleanup k8s resources
         if: always()
+        run: |
+          kubectl delete --namespace=$DEPLOY_NS service,statefulset,configmap,pod,job --all --ignore-not-found || true
+
+      - name: Delete k3d cluster
+        if: always()
+        run: |
+          k3d cluster delete $K3D_CLUSTER_NAME || true
 
   # Verify whether the Makefile builds the node (no dependencies other than Go)
   node:
@@ -273,7 +344,7 @@ jobs:
   # Run Go linters
   node-lint:
     # The linter is slow enough that we want to run it on the self-hosted runner
-    runs-on: tilt-kube-public
+    runs-on: ubuntu-latest
     concurrency:
       group: ${{ github.workflow }}-lint-${{ github.ref }}
       cancel-in-progress: true
@@ -315,7 +386,7 @@ jobs:
   # Run Go tests
   node-tests:
     # The tests are slow enough that we want to run it on the self-hosted runner
-    runs-on: tilt-kube-public
+    runs-on: ubuntu-latest
     concurrency:
       group: ${{ github.workflow }}-test-${{ github.ref }}
       cancel-in-progress: true
@@ -357,10 +428,10 @@ jobs:
           # SVM directory (shims code)
           - path: svm/wormhole-core-shims/Cargo.toml
             args: "--workspace --no-default-features --features solana" # The crate by default requires environment variables. If solana is specified, mainnet values are used.
-            test_args: "--lib"  # Skip integration tests; they require compiled BPF programs
+            test_args: "--lib" # Skip integration tests; they require compiled BPF programs
           - path: svm/wormhole-core-shims/anchor/Cargo.toml
             args: "--workspace"
-            test_args: "--lib"  # Skip doctests; anchor interfaces lack solana_program dependency
+            test_args: "--lib" # Skip doctests; anchor interfaces lack solana_program dependency
           # Token Metadata parser for SVM token bridge
           - path: solana/modules/token_bridge/token_metadata_parser/Cargo.toml
             args: "--workspace"
