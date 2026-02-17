@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -48,14 +49,17 @@ import (
 const (
 	transferComplete = true
 	transferEnqueued = false
-)
 
-const maxEnqueuedTime = time.Hour * 24
+	// maxEnqueuedTime is the maximum time that a transfer can be queued before it is released.
+	maxEnqueuedTime = time.Hour * 24
+)
 
 type (
 	// Layout of the config data for each token
 	TokenConfigEntry struct {
-		Chain       uint16
+		// Chain is the Wormhole chain ID of the token's source chain (where the token was minted).
+		Chain uint16
+		// Addr is the token's address on the source chain in Wormhole normalized format.
 		Addr        string
 		Symbol      string
 		CoinGeckoId string
@@ -102,8 +106,8 @@ type (
 	// supported token.
 	transfer struct {
 		dbTransfer *guardianDB.Transfer
-		// Corresponds to dbTransfers.Value field, but may be negative
-		value int64
+		// Corresponds to dbTransfers.ScaledValue field, but may be negative
+		scaledValue int64
 	}
 
 	// Payload of the map of chains being monitored. Contains transfer data for both emitted and received transfers.
@@ -126,6 +130,11 @@ type (
 		second vaa.ChainID
 	}
 )
+
+func (e *TokenConfigEntry) String() string {
+	// ignore decimals and price
+	return fmt.Sprintf("%d:%s:%s:%s", e.Chain, e.Addr, e.Symbol, e.CoinGeckoId)
+}
 
 // valid checks whether a corridor is valid. A corridor is invalid if both chain IDs are equal.
 func (p *corridor) valid() bool {
@@ -153,14 +162,14 @@ func (p *corridor) equals(p2 *corridor) bool {
 }
 
 // newTransferFromDbTransfer converts a db.Transfer into a transfer. It
-// performs a bounds check on dbTransfer.Value to ensure it can fit into int64.
-// This should always be the case for normal operations as dbTransfer.Value
-// represents the USD value of a transfer, which should be less than the max int64 value.
+// performs a bounds check on dbTransfer.ScaledValue to ensure it can fit into int64.
+// This should always be the case for normal operations as dbTransfer.ScaledValue
+// represents the scaled USD value of a transfer, which should be less than the max int64 value.
 func newTransferFromDbTransfer(dbTransfer *guardianDB.Transfer) (tx transfer, err error) {
-	if dbTransfer.Value > math.MaxInt64 {
-		return tx, fmt.Errorf("value for db.Transfer exceeds MaxInt64: %d", dbTransfer.Value)
+	if dbTransfer.ScaledValue > math.MaxInt64 {
+		return tx, fmt.Errorf("scaledValue for db.Transfer exceeds MaxInt64: %d", dbTransfer.ScaledValue)
 	}
-	return transfer{dbTransfer, int64(dbTransfer.Value)}, nil
+	return transfer{dbTransfer, int64(dbTransfer.ScaledValue)}, nil
 }
 
 // addFlowCancelTransfer appends a transfer to a ChainEntry's transfers property.
@@ -168,20 +177,20 @@ func newTransferFromDbTransfer(dbTransfer *guardianDB.Transfer) (tx transfer, er
 // SECURITY: The calling code is responsible for ensuring that the transfer's source and destination has a matching flow cancel corridor.
 // SECURITY: This method performs validation to ensure that the Flow Cancel transfer is valid. This is important to
 // ensure that the Governor usage cannot be lowered due to malicious or invalid transfers.
-// - the Value must be negative (in order to ultimately reduce the Governor usage of the target chain)
+// - the ScaledValue must be negative (in order to ultimately reduce the Governor usage of the target chain)
 // - the TargetChain must match the chain ID of the Chain Entry
 func (ce *chainEntry) addFlowCancelTransfer(transfer transfer) error {
-	value := transfer.value
+	value := transfer.scaledValue
 	targetChain := transfer.dbTransfer.TargetChain
 	if value > 0 {
 		return fmt.Errorf("flow cancel transfer Value must be negative. Value: %d", value)
 	}
-	if transfer.dbTransfer.Value > math.MaxInt64 {
-		return fmt.Errorf("value for transfer.dbTransfer exceeds MaxInt64: %d", transfer.dbTransfer.Value)
+	if transfer.dbTransfer.ScaledValue > math.MaxInt64 {
+		return fmt.Errorf("scaledValue for transfer.dbTransfer exceeds MaxInt64: %d", transfer.dbTransfer.ScaledValue)
 	}
 	//#nosec G115: Type conversion is safe here because of the MaxInt64 bounds check above
-	if value != -int64(transfer.dbTransfer.Value) {
-		return fmt.Errorf("transfer is invalid: transfer.value %d must equal the inverse of transfer.dbTransfer.Value %d", value, transfer.dbTransfer.Value)
+	if value != -int64(transfer.dbTransfer.ScaledValue) {
+		return fmt.Errorf("transfer is invalid: transfer.scaledValue %d must equal the inverse of transfer.dbTransfer.ScaledValue %d", value, transfer.dbTransfer.ScaledValue)
 	}
 	if targetChain != ce.emitterChainId {
 		return fmt.Errorf("flow cancel transfer TargetChain %s does not match this chainEntry %s", targetChain, ce.emitterChainId)
@@ -207,13 +216,13 @@ func (ce *chainEntry) addFlowCancelTransferFromDbTransfer(dbTransfer *guardianDB
 }
 
 // inverse takes a transfer and returns a copy of that transfer with the
-// additive inverse of its Value property (i.e. flip the sign).
+// additive inverse of its ScaledValue property (i.e. flip the sign).
 func (t *transfer) inverse() transfer {
-	return transfer{t.dbTransfer, -t.value}
+	return transfer{t.dbTransfer, -t.scaledValue}
 }
 
 func (ce *chainEntry) isBigTransfer(value uint64) bool {
-	return value >= ce.bigTransactionSize && ce.checkForBigTransactions
+	return value >= ce.bigTransactionSize*guardianDB.ScaledValueFactor && ce.checkForBigTransactions
 }
 
 type ChainGovernor struct {
@@ -313,38 +322,52 @@ func (gov *ChainGovernor) initConfig() error {
 		gov.flowCancelCorridors = flowCancelCorridors
 	}
 
-	for _, ct := range configTokens {
-		addr, err := vaa.StringToAddress(ct.Addr)
+	for _, token := range configTokens {
+		addr, err := vaa.StringToAddress(token.Addr)
 		if err != nil {
-			return fmt.Errorf("invalid address: %s", ct.Addr)
+			return fmt.Errorf("invalid address: %s", token.Addr)
 		}
 
-		cfgPrice := big.NewFloat(ct.Price)
+		// Ignore tokens with a chain that is not configured in the chains list.
+		// Ideally this should never happen, but it's possible that a token is added to the config
+		// without a corresponding chain entry.
+		if !slices.ContainsFunc(configChains, func(c ChainConfigEntry) bool {
+			return c.EmitterChainID == vaa.ChainID(token.Chain)
+		}) {
+			gov.logger.Info(
+				"ignoring token with chain not configured in chains list",
+				zap.String("token", token.String()),
+			)
+			continue
+		}
+
+		cfgPrice := big.NewFloat(token.Price)
 		initialPrice := new(big.Float)
 		initialPrice.Set(cfgPrice)
 
 		// Transfers have a maximum of eight decimal places.
-		dec := ct.Decimals
+		dec := token.Decimals
 		if dec > 8 {
 			dec = 8
 		}
 
+		// NOTE: Converts a value of 0 for decimals to 1.
 		decimalsFloat := big.NewFloat(math.Pow(10.0, float64(dec)))
 		decimals, _ := decimalsFloat.Int(nil)
 
 		// Some Solana tokens don't have the symbol set. In that case, use the chain and token address as the symbol.
-		symbol := ct.Symbol
+		symbol := token.Symbol
 		if symbol == "" {
-			symbol = fmt.Sprintf("%d:%s", ct.Chain, ct.Addr)
+			symbol = fmt.Sprintf("%d:%s", token.Chain, token.Addr)
 		}
 
-		key := tokenKey{chain: vaa.ChainID(ct.Chain), addr: addr}
+		key := tokenKey{chain: vaa.ChainID(token.Chain), addr: addr}
 		te := &tokenEntry{
 			cfgPrice:    cfgPrice,
 			price:       initialPrice,
 			decimals:    decimals,
 			symbol:      symbol,
-			coinGeckoId: ct.CoinGeckoId,
+			coinGeckoId: token.CoinGeckoId,
 			token:       key,
 		}
 		te.updatePrice()
@@ -367,7 +390,7 @@ func (gov *ChainGovernor) initConfig() error {
 				zap.String("coinGeckoId", te.coinGeckoId),
 				zap.String("price", te.price.String()),
 				zap.Int64("decimals", dec),
-				zap.Int64("origDecimals", ct.Decimals),
+				zap.Int64("origDecimals", token.Decimals),
 			)
 		}
 	}
@@ -533,7 +556,7 @@ func (gov *ChainGovernor) processMsgForTime(msg *common.MessagePublication, now 
 
 	// Get all outgoing transfers for `emitterChainEntry` that happened within the last 24 hours
 	startTime := now.Add(-time.Minute * time.Duration(gov.dayLengthInMinutes))
-	prevTotalValue, err := gov.trimAndSumValueForChain(emitterChainEntry, startTime)
+	prevScaledTotalValue, err := gov.trimAndSumValueForChain(emitterChainEntry, startTime)
 	if err != nil {
 		gov.logger.Error("Error when attempting to trim and sum transfers",
 			zap.String("msgID", msg.MessageIDString()),
@@ -544,8 +567,8 @@ func (gov *ChainGovernor) processMsgForTime(msg *common.MessagePublication, now 
 		return false, err
 	}
 
-	// Compute the notional USD value of the transfers
-	value, err := computeValue(payload.Amount, token)
+	// Compute the scaled notional USD value.
+	scaledValue, err := scaledUsdValue(payload.Amount, token)
 	if err != nil {
 		gov.logger.Error("failed to compute value of transfer",
 			zap.String("msgID", msg.MessageIDString()),
@@ -556,40 +579,40 @@ func (gov *ChainGovernor) processMsgForTime(msg *common.MessagePublication, now 
 		return false, err
 	}
 
-	newTotalValue := prevTotalValue + value
-	if newTotalValue < prevTotalValue {
-		gov.logger.Error("total value has overflowed",
+	newScaledTotalValue := prevScaledTotalValue + scaledValue
+	if newScaledTotalValue < prevScaledTotalValue {
+		gov.logger.Error("total scaled value has overflowed",
 			zap.String("msgID", msg.MessageIDString()),
 			zap.String("hash", hash),
 			zap.String("txID", msg.TxIDString()),
-			zap.Uint64("prevTotalValue", prevTotalValue),
-			zap.Uint64("newTotalValue", newTotalValue),
+			zap.Uint64("prevTotalScaledValue", prevScaledTotalValue),
+			zap.Uint64("newTotalScaledValue", newScaledTotalValue),
 		)
-		return false, fmt.Errorf("total value has overflowed")
+		return false, fmt.Errorf("total scaled value has overflowed")
 	}
 
 	enqueueIt := false
 	var releaseTime time.Time
-	if emitterChainEntry.isBigTransfer(value) {
+	if emitterChainEntry.isBigTransfer(scaledValue) {
 		enqueueIt = true
 		releaseTime = now.Add(maxEnqueuedTime)
 		gov.logger.Error("enqueuing vaa because it is a big transaction",
-			zap.Uint64("value", value),
-			zap.Uint64("prevTotalValue", prevTotalValue),
-			zap.Uint64("newTotalValue", newTotalValue),
+			zap.Uint64("value", scaleDownUsdValue(scaledValue)),
+			zap.Uint64("prevTotalValue", scaleDownUsdValue(prevScaledTotalValue)),
+			zap.Uint64("newTotalValue", scaleDownUsdValue(newScaledTotalValue)),
 			zap.String("msgID", msg.MessageIDString()),
 			zap.Stringer("releaseTime", releaseTime),
 			zap.Uint64("bigTransactionSize", emitterChainEntry.bigTransactionSize),
 			zap.String("hash", hash),
 			zap.String("txID", msg.TxIDString()),
 		)
-	} else if newTotalValue > emitterChainEntry.dailyLimit {
+	} else if newScaledTotalValue > emitterChainEntry.dailyLimit*guardianDB.ScaledValueFactor {
 		enqueueIt = true
 		releaseTime = now.Add(maxEnqueuedTime)
 		gov.logger.Error("enqueuing vaa because it would exceed the daily limit",
-			zap.Uint64("value", value),
-			zap.Uint64("prevTotalValue", prevTotalValue),
-			zap.Uint64("newTotalValue", newTotalValue),
+			zap.Uint64("value", scaleDownUsdValue(scaledValue)),
+			zap.Uint64("prevTotalValue", scaleDownUsdValue(prevScaledTotalValue)),
+			zap.Uint64("newTotalValue", scaleDownUsdValue(newScaledTotalValue)),
 			zap.Stringer("releaseTime", releaseTime),
 			zap.String("msgID", msg.MessageIDString()),
 			zap.String("hash", hash),
@@ -619,9 +642,9 @@ func (gov *ChainGovernor) processMsgForTime(msg *common.MessagePublication, now 
 	}
 
 	gov.logger.Info("posting vaa",
-		zap.Uint64("value", value),
-		zap.Uint64("prevTotalValue", prevTotalValue),
-		zap.Uint64("newTotalValue", newTotalValue),
+		zap.Uint64("value", scaleDownUsdValue(scaledValue)),
+		zap.Uint64("prevTotalValue", scaleDownUsdValue(prevScaledTotalValue)),
+		zap.Uint64("newTotalValue", scaleDownUsdValue(newScaledTotalValue)),
 		zap.String("msgID", msg.MessageIDString()),
 		zap.String("hash", hash),
 		zap.String("txID", msg.TxIDString()),
@@ -629,7 +652,7 @@ func (gov *ChainGovernor) processMsgForTime(msg *common.MessagePublication, now 
 
 	dbTransfer := guardianDB.Transfer{
 		Timestamp:      now,
-		Value:          value,
+		ScaledValue:    scaledValue,
 		OriginChain:    token.token.chain,
 		OriginAddress:  token.token.addr,
 		EmitterChain:   msg.EmitterChain,
@@ -660,9 +683,9 @@ func (gov *ChainGovernor) processMsgForTime(msg *common.MessagePublication, now 
 	// the usage of this chain the next time that the Governor processes a transfer.
 	// For the destination chain entry, add the inverse of this transfer.
 	// e.g. A transfer of USDC originally minted on Solana is sent from Ethereum to Sui.
-	// - This increases the Governor usage of Ethereum by the `transfer.Value` amount.
+	// - This increases the Governor usage of Ethereum by the `transfer.ScaledValue` amount.
 	// - If the USDC version of Solana is flow cancelled, we also want to decrease the Governor usage for Sui.
-	// - We do this by adding an 'inverse' transfer to Sui's chainEntry that contains a negative `transfer.Value`.
+	// - We do this by adding an 'inverse' transfer to Sui's chainEntry that contains a negative `transfer.ScaledValue`.
 	// - This will cause the summed value of Sui to decrease.
 	emitterChainEntry.transfers = append(emitterChainEntry.transfers, transfer)
 
@@ -804,12 +827,12 @@ func (gov *ChainGovernor) checkPendingForTime(now time.Time) ([]*common.MessageP
 		// Keep going as long as we find something that will fit.
 		for {
 			foundOne := false
-			prevTotalValue, err := gov.trimAndSumValueForChain(ce, startTime)
+			prevScaledTotalValue, err := gov.trimAndSumValueForChain(ce, startTime)
 			if err != nil {
 				gov.logger.Error("error when attempting to trim and sum transfers", zap.Error(err))
 				gov.logger.Error("refusing to release transfers for this chain until the sum can be correctly calculated",
 					zap.Stringer("chainId", chainId),
-					zap.Uint64("prevTotalValue", prevTotalValue),
+					zap.Uint64("prevSScaledTotalValue", prevScaledTotalValue),
 					zap.Error(err))
 				gov.msgsToPublish = msgsToPublish
 				// Skip further processing for this chain entry
@@ -818,7 +841,7 @@ func (gov *ChainGovernor) checkPendingForTime(now time.Time) ([]*common.MessageP
 
 			// Keep going until we find something that fits or hit the end.
 			for idx, pe := range ce.pending {
-				value, err := computeValue(pe.amount, pe.token)
+				scaledValue, err := scaledUsdValue(pe.amount, pe.token)
 				if err != nil {
 					gov.logger.Error("failed to compute value for pending vaa",
 						zap.Stringer("amount", pe.amount),
@@ -832,7 +855,7 @@ func (gov *ChainGovernor) checkPendingForTime(now time.Time) ([]*common.MessageP
 				}
 
 				countsTowardsTransfers := true
-				if ce.isBigTransfer(value) {
+				if ce.isBigTransfer(scaledValue) {
 					if now.Before(pe.dbData.ReleaseTime) {
 						continue // Keep waiting for the timer to expire.
 					}
@@ -841,7 +864,8 @@ func (gov *ChainGovernor) checkPendingForTime(now time.Time) ([]*common.MessageP
 					gov.logger.Info("posting pending big vaa because the release time has been reached",
 						zap.Stringer("amount", pe.amount),
 						zap.Stringer("price", pe.token.price),
-						zap.Uint64("value", value),
+						zap.Uint64("scaledValue", scaledValue),
+						zap.Uint64("value", scaleDownUsdValue(scaledValue)),
 						zap.Stringer("releaseTime", pe.dbData.ReleaseTime),
 						zap.String("msgID", pe.dbData.Msg.MessageIDString()))
 				} else if now.After(pe.dbData.ReleaseTime) {
@@ -849,17 +873,18 @@ func (gov *ChainGovernor) checkPendingForTime(now time.Time) ([]*common.MessageP
 					gov.logger.Info("posting pending vaa because the release time has been reached",
 						zap.Stringer("amount", pe.amount),
 						zap.Stringer("price", pe.token.price),
-						zap.Uint64("value", value),
+						zap.Uint64("scaledValue", scaledValue),
+						zap.Uint64("value", scaleDownUsdValue(scaledValue)),
 						zap.Stringer("releaseTime", pe.dbData.ReleaseTime),
 						zap.String("msgID", pe.dbData.Msg.MessageIDString()))
 				} else {
-					newTotalValue := prevTotalValue + value
-					if newTotalValue < prevTotalValue {
+					newScaledTotalValue := prevScaledTotalValue + scaledValue
+					if newScaledTotalValue < prevScaledTotalValue {
 						gov.msgsToPublish = msgsToPublish
 						return nil, fmt.Errorf("total value has overflowed")
 					}
 
-					if newTotalValue > ce.dailyLimit {
+					if newScaledTotalValue > ce.dailyLimit*guardianDB.ScaledValueFactor {
 						// This one won't fit. Keep checking other enqueued ones.
 						continue
 					}
@@ -867,9 +892,10 @@ func (gov *ChainGovernor) checkPendingForTime(now time.Time) ([]*common.MessageP
 					gov.logger.Info("posting pending vaa",
 						zap.Stringer("amount", pe.amount),
 						zap.Stringer("price", pe.token.price),
-						zap.Uint64("value", value),
-						zap.Uint64("prevTotalValue", prevTotalValue),
-						zap.Uint64("newTotalValue", newTotalValue),
+						zap.Uint64("scaledValue", scaledValue),
+						zap.Uint64("value", scaleDownUsdValue(scaledValue)),
+						zap.Uint64("prevTotalValue", scaleDownUsdValue(prevScaledTotalValue)),
+						zap.Uint64("newTotalValue", scaleDownUsdValue(newScaledTotalValue)),
 						zap.String("msgID", pe.dbData.Msg.MessageIDString()),
 						zap.String("flowCancels", strconv.FormatBool(pe.token.flowCancels)))
 				}
@@ -891,7 +917,7 @@ func (gov *ChainGovernor) checkPendingForTime(now time.Time) ([]*common.MessageP
 					if countsTowardsTransfers {
 						dbTransfer := guardianDB.Transfer{
 							Timestamp:      now,
-							Value:          value,
+							ScaledValue:    scaledValue,
 							OriginChain:    pe.token.token.chain,
 							OriginAddress:  pe.token.token.addr,
 							EmitterChain:   pe.dbData.Msg.EmitterChain,
@@ -966,7 +992,19 @@ func (gov *ChainGovernor) checkPendingForTime(now time.Time) ([]*common.MessageP
 	return msgsToPublish, nil
 }
 
-func computeValue(amount *big.Int, token *tokenEntry) (uint64, error) {
+// scaledUsdValue converts an amount of a token into a scaled USD value. This is done by multiplying the amount by the token's price
+// and the scaling factor before scaling down the result to the token's number of decimals.
+// The amount must be greater than or equal to zero. The token's price must be positive.
+func scaledUsdValue(amount *big.Int, token *tokenEntry) (uint64, error) {
+
+	// Ensure that the input is valid:
+	// - Price must be non-nil and greater than or equal to zero.
+	// - Amount must be non-nil and non-negative.
+	if amount == nil || amount.Sign() == -1 ||
+		token == nil || token.price == nil || token.price.Sign() <= 0 {
+		return 0, fmt.Errorf("usdValue: invalid input for amount or token")
+	}
+
 	amountFloat := new(big.Float)
 	amountFloat = amountFloat.SetInt(amount)
 
@@ -974,15 +1012,31 @@ func computeValue(amount *big.Int, token *tokenEntry) (uint64, error) {
 	valueFloat = valueFloat.Mul(amountFloat, token.price)
 
 	valueBigInt, _ := valueFloat.Int(nil)
-	valueBigInt = valueBigInt.Div(valueBigInt, token.decimals)
+
+	// Scale the value up to increase precision
+	valueBigInt = valueBigInt.Mul(valueBigInt, big.NewInt(guardianDB.ScaledValueFactor))
+
+	// Defense-in-depth: avoid division by zero.
+	if token.decimals.Sign() != 0 {
+		valueBigInt = valueBigInt.Div(valueBigInt, token.decimals)
+	}
 
 	if !valueBigInt.IsUint64() {
-		return 0, fmt.Errorf("value is too large to fit in uint64")
+		return 0, fmt.Errorf("usdValue: value is too large to fit in uint64")
 	}
 
 	value := valueBigInt.Uint64()
 
 	return value, nil
+}
+
+// scaleDownUsdValue converts a scaled USD value back into a normal USD value by dividing by the scaling factor.
+func scaleDownUsdValue(scaledValue uint64) uint64 {
+	// For clarity, we happily truncate to zero here.
+	if scaledValue < guardianDB.ScaledValueFactor {
+		return 0
+	}
+	return scaledValue / guardianDB.ScaledValueFactor
 }
 
 // tryAddFlowCancelTransfer adds an inverse transfer to the destination chain entry. This occurs only if the transfer's asset
@@ -1069,8 +1123,8 @@ func (gov *ChainGovernor) trimAndSumValueForChain(chainEntry *chainEntry, startT
 	var sumValue int64
 	sumValue, chainEntry.transfers, err = gov.trimAndSumValue(chainEntry.transfers, startTime)
 	if err != nil {
-		// Return the daily limit as the sum so that any further transfers will be queued.
-		return chainEntry.dailyLimit, err
+		// Return the scaled daily limit as the sum so that any further transfers will be queued.
+		return chainEntry.dailyLimit * guardianDB.ScaledValueFactor, err
 	}
 
 	// Return 0 even if the sum is negative.
@@ -1100,13 +1154,13 @@ func (gov *ChainGovernor) trimAndSumValue(transfers []transfer, startTime time.T
 		if t.dbTransfer.Timestamp.Before(startTime) {
 			trimIdx = idx
 		} else {
-			checkedSum, err := CheckedAddInt64(sum, t.value)
+			checkedSum, err := CheckedAddInt64(sum, t.scaledValue)
 			if err != nil {
 				// We have to stop and return an error here (rather than saturate, for example). The
-				// transfers are not sorted by value so we can't make any guarantee on the final value
+				// transfers are not sorted by scaledValue so we can't make any guarantee on the final value
 				// if we hit the upper or lower bound. We don't expect this to happen in any case
 				// because we don't expect this number to ever overflow, as it would represent
-				// $184467440737095516.15 USD moving between two chains in a 24h period.
+				// $18 trillion USD moving between two chains in a 24h period.
 				return 0, transfers, err
 			}
 			sum = checkedSum

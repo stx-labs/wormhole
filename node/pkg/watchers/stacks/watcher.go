@@ -1,12 +1,12 @@
 package stacks
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,6 +16,7 @@ import (
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	"github.com/certusone/wormhole/node/pkg/readiness"
 	"github.com/certusone/wormhole/node/pkg/supervisor"
+	clarity "github.com/stx-labs/clarity-go"
 	"github.com/wormhole-foundation/wormhole/sdk/vaa"
 	"go.uber.org/zap"
 )
@@ -37,12 +38,11 @@ import (
 //
 // API Interaction, aka fetch methods are in `fetch.go`.
 
-// Safe overflow checking constants for BigInt validation
+// Safe overflow checking constants
 var (
 	maxUint32BigInt = big.NewInt(math.MaxUint32)
 	maxUint64BigInt = new(big.Int).SetUint64(math.MaxUint64)
 	maxUint8BigInt  = big.NewInt(math.MaxUint8)
-	maxInt64        = uint64(math.MaxInt64)
 )
 
 type (
@@ -50,6 +50,7 @@ type (
 		rpcURL        string
 		rpcAuthToken  string
 		stateContract string
+		httpClient    *http.Client
 
 		bitcoinBlockPollInterval time.Duration
 
@@ -85,6 +86,7 @@ func NewWatcher(
 		rpcURL:                   rpcURL,
 		rpcAuthToken:             rpcAuthToken,
 		stateContract:            contract,
+		httpClient:               &http.Client{Timeout: 30 * time.Second},
 		bitcoinBlockPollInterval: bitcoinBlockPollInterval,
 		msgC:                     msgC,
 		obsvReqC:                 obsvReqC,
@@ -95,6 +97,19 @@ func NewWatcher(
 	w.processedBitcoinHeight.Store(0)
 
 	return w
+}
+
+// doRequest executes an HTTP request using the watcher's configured client.
+func (w *Watcher) doRequest(req *http.Request) (*http.Response, error) {
+	return w.httpClient.Do(req)
+}
+
+// doAuthorizedRequest executes an HTTP request with the Authorization header set.
+func (w *Watcher) doAuthorizedRequest(req *http.Request) (*http.Response, error) {
+	if w.rpcAuthToken != "" {
+		req.Header.Set("Authorization", w.rpcAuthToken)
+	}
+	return w.httpClient.Do(req)
 }
 
 /// WATCHER PUBLIC METHODS
@@ -169,6 +184,11 @@ func (w *Watcher) Reobserve(ctx context.Context, chainID vaa.ChainID, txID []byt
 		return 0, fmt.Errorf("unexpected chain ID: %v", chainID)
 	}
 
+	// Validate transaction ID length (must be exactly 32 bytes / 64 hex chars)
+	if len(txID) != TransactionIDSize {
+		return 0, fmt.Errorf("invalid transaction ID length: expected %d bytes, got %d", TransactionIDSize, len(txID))
+	}
+
 	txIdString := hex.EncodeToString(txID)
 	logger.Info("Received reobservation request",
 		zap.String("tx_id", txIdString),
@@ -204,7 +224,7 @@ func (w *Watcher) runBlockPoller(ctx context.Context) error {
 
 	var nakamotoEpoch *StacksV2PoxEpoch
 	for _, epoch := range poxInfo.Epochs {
-		if epoch.EpochID == "Epoch30" {
+		if epoch.EpochID == NakamotoEpochID {
 			nakamotoEpoch = &epoch
 			break
 		}
@@ -232,14 +252,8 @@ func (w *Watcher) runBlockPoller(ctx context.Context) error {
 	logger.Info("Initialized Stacks watcher with stable Bitcoin (burn) block",
 		zap.Uint64("stable_bitcoin_block_height", nodeInfo.StableBurnBlockHeight))
 
-	// Convert StableBurnBlockHeight to int64 with overflow check
-	stableHeight := nodeInfo.StableBurnBlockHeight
-	if stableHeight > maxInt64 {
-		return fmt.Errorf("stable burn block height %d exceeds maximum int64 value", stableHeight)
-	}
-
 	p2p.DefaultRegistry.SetNetworkStats(vaa.ChainIDStacks, &gossipv1.Heartbeat_Network{
-		Height:          int64(stableHeight), // #nosec G115 -- checked above
+		Height:          int64(nodeInfo.StableBurnBlockHeight), // #nosec G115 -- block heights will never exceed int64 max
 		ContractAddress: w.stateContract,
 	})
 
@@ -270,17 +284,8 @@ func (w *Watcher) runBlockPoller(ctx context.Context) error {
 
 				w.stableBitcoinHeight.Store(nodeInfo.StableBurnBlockHeight)
 
-				// Convert StableBurnBlockHeight to int64 with overflow check
-				newStableHeight := nodeInfo.StableBurnBlockHeight
-				if newStableHeight > maxInt64 {
-					logger.Error("Stable burn block height exceeds maximum int64 value",
-						zap.Uint64("height", newStableHeight))
-					timer.Reset(w.bitcoinBlockPollInterval)
-					continue
-				}
-
 				p2p.DefaultRegistry.SetNetworkStats(vaa.ChainIDStacks, &gossipv1.Heartbeat_Network{
-					Height:          int64(newStableHeight), // #nosec G115 -- checked above
+					Height:          int64(nodeInfo.StableBurnBlockHeight), // #nosec G115 -- block heights will never exceed int64 max
 					ContractAddress: w.stateContract,
 				})
 
@@ -318,6 +323,15 @@ func (w *Watcher) processBitcoinBlock(ctx context.Context, tenureBlocks *StacksV
 		zap.Uint64("bitcoin_block_height", tenureBlocks.BurnBlockHeight),
 		zap.String("bitcoin_block_hash", tenureBlocks.BurnBlockHash))
 
+	// Check if there are any Stacks blocks anchored to this Bitcoin block
+	// Note: It's valid for a Bitcoin block to have no Stacks blocks
+	if tenureBlocks.StacksBlocks == nil || len(tenureBlocks.StacksBlocks) == 0 {
+		logger.Info("No Stacks blocks found for Bitcoin block",
+			zap.Uint64("bitcoin_block_height", tenureBlocks.BurnBlockHeight),
+			zap.String("bitcoin_block_hash", tenureBlocks.BurnBlockHash))
+		return
+	}
+
 	// Process each Stacks block anchored to this burn block
 	for _, block := range tenureBlocks.StacksBlocks {
 		logger.Info("Processing Stacks block", zap.String("stacks_block_id", block.BlockId))
@@ -339,6 +353,13 @@ func (w *Watcher) processStacksBlock(ctx context.Context, blockHash string, logg
 		return fmt.Errorf("failed to fetch Stacks block replay: %w", err)
 	}
 
+	// Stacks blocks are expected to always contain at least one transaction
+	if len(replay.Transactions) == 0 {
+		return fmt.Errorf("block %s has no transactions", blockHash)
+	}
+
+	// Process transactions in order returned by Stacks node.
+	// We rely on the node to provide stable, consistent ordering.
 	for _, tx := range replay.Transactions {
 		if _, err := w.processStacksTransaction(ctx, &tx, replay, false, logger); err != nil {
 			logger.Error("Failed to process transaction",
@@ -356,7 +377,7 @@ func (w *Watcher) processStacksTransaction(_ context.Context, tx *StacksV3Tenure
 	logger.Info("Processing Stacks transaction", zap.String("tx_id", tx.TxId))
 
 	// abort_by_response (non-okay response)
-	if !strings.HasPrefix(tx.ResultHex, "0x07") { // (ok) is 0x07...
+	if !strings.HasPrefix(tx.ResultHex, OkPrefixHex) { // (ok) response prefix
 		return 0, fmt.Errorf("transaction %s failed due to response hex: %s", tx.TxId, tx.ResultHex)
 	}
 
@@ -388,6 +409,17 @@ func (w *Watcher) processStacksTransaction(_ context.Context, tx *StacksV3Tenure
 			zap.Uint64("event_index", event.EventIndex))
 
 		hexStr := strings.TrimPrefix(event.ContractEvent.RawValue, "0x")
+
+		// Check length before decoding (hex encoding is 2 bytes per character)
+		if len(hexStr) > MaxClarityValueHexSize {
+			logger.Error("Clarity value hex string exceeds maximum size",
+				zap.String("tx_id", tx.TxId),
+				zap.Uint64("event_index", event.EventIndex),
+				zap.Int("size", len(hexStr)),
+				zap.Int("max_size", MaxClarityValueHexSize))
+			continue
+		}
+
 		hexBytes, err := hex.DecodeString(hexStr)
 		if err != nil {
 			logger.Error("Failed to decode raw value hex",
@@ -398,7 +430,7 @@ func (w *Watcher) processStacksTransaction(_ context.Context, tx *StacksV3Tenure
 			continue
 		}
 
-		clarityValue, err := DecodeClarityValue(bytes.NewReader(hexBytes))
+		clarityValue, err := clarity.Decode(hexBytes)
 		if err != nil {
 			logger.Error("Failed to decode clarity value",
 				zap.String("tx_id", tx.TxId),
@@ -440,11 +472,15 @@ func (w *Watcher) reobserveStacksTransactionByTxId(ctx context.Context, txId str
 		return 0, fmt.Errorf("failed to fetch transaction: %w", err)
 	}
 
+	if transaction.BlockHeight == nil {
+		return 0, fmt.Errorf("transaction %s has no block height", txId)
+	}
+
 	if !transaction.IsCanonical {
 		return 0, fmt.Errorf("transaction %s is not in the canonical chain", txId)
 	}
 
-	if !strings.HasPrefix(transaction.Result, "(ok ") {
+	if !strings.HasPrefix(transaction.Result, OkPrefix) {
 		return 0, fmt.Errorf("transaction %s failed due to result: %s", txId, transaction.Result)
 	}
 
@@ -480,9 +516,9 @@ func (w *Watcher) reobserveStacksTransactionByTxId(ctx context.Context, txId str
 }
 
 // Processes a core contract event tuple and extracts message fields
-func (w *Watcher) processCoreEvent(clarityValue ClarityValue, txId string, timestamp uint64, isReobservation bool) error {
+func (w *Watcher) processCoreEvent(clarityValue clarity.Value, txId string, timestamp uint64, isReobservation bool) error {
 	// Cast to tuple
-	eventTuple, isTuple := clarityValue.(*Tuple)
+	eventTuple, isTuple := clarityValue.(*clarity.Tuple)
 	if !isTuple {
 		return fmt.Errorf("expected tuple type but got %T", clarityValue)
 	}
@@ -504,6 +540,11 @@ func (w *Watcher) processCoreEvent(clarityValue ClarityValue, txId string, times
 		return fmt.Errorf("failed to extract message data: %w", err)
 	}
 
+	// For now, we only support consistency level 0 (enum, "publish when tx is stable")
+	if msgData.ConsistencyLevel != 0 {
+		return fmt.Errorf("consistency level %d is not supported", msgData.ConsistencyLevel)
+	}
+
 	// Convert txId to bytes
 	txIdBytes, err := hex.DecodeString(strings.TrimPrefix(txId, "0x"))
 	if err != nil {
@@ -511,7 +552,7 @@ func (w *Watcher) processCoreEvent(clarityValue ClarityValue, txId string, times
 	}
 
 	// Convert timestamp to int64 with overflow check
-	if timestamp > maxInt64 {
+	if timestamp > math.MaxInt64 {
 		return fmt.Errorf("timestamp %d exceeds maximum int64 value", timestamp)
 	}
 
@@ -537,7 +578,11 @@ func (w *Watcher) processCoreEvent(clarityValue ClarityValue, txId string, times
 /// HELPERS
 
 // Extracts the event name from an event tuple
-func extractEventName(eventTuple *Tuple) (string, error) {
+func extractEventName(eventTuple *clarity.Tuple) (string, error) {
+	if eventTuple == nil {
+		return "", fmt.Errorf("eventTuple is nil")
+	}
+
 	eventNameVal, ok := eventTuple.Values["event"]
 	if !ok {
 		return "", fmt.Errorf("missing 'event' field in tuple")
@@ -545,9 +590,9 @@ func extractEventName(eventTuple *Tuple) (string, error) {
 
 	// Check if event is a StringASCII or StringUTF8
 	var eventName string
-	if strVal, ok := eventNameVal.(*StringASCII); ok {
+	if strVal, ok := eventNameVal.(*clarity.StringASCII); ok {
 		eventName = strVal.Value
-	} else if strVal, ok := eventNameVal.(*StringUTF8); ok {
+	} else if strVal, ok := eventNameVal.(*clarity.StringUTF8); ok {
 		eventName = strVal.Value
 	} else {
 		return "", fmt.Errorf("'event' field is not a string type: %T", eventNameVal)
@@ -557,7 +602,11 @@ func extractEventName(eventTuple *Tuple) (string, error) {
 }
 
 // Extracts core message fields from an event tuple
-func extractMessageData(eventTuple *Tuple) (*MessageData, error) {
+func extractMessageData(eventTuple *clarity.Tuple) (*MessageData, error) {
+	if eventTuple == nil {
+		return nil, fmt.Errorf("eventTuple is nil")
+	}
+
 	// Get the data field which should contain the message
 	dataVal, ok := eventTuple.Values["data"]
 	if !ok {
@@ -565,7 +614,7 @@ func extractMessageData(eventTuple *Tuple) (*MessageData, error) {
 	}
 
 	// Cast data to tuple
-	msgTuple, ok := dataVal.(*Tuple)
+	msgTuple, ok := dataVal.(*clarity.Tuple)
 	if !ok {
 		return nil, fmt.Errorf("'data' field is not a tuple: %T", dataVal)
 	}
@@ -576,9 +625,9 @@ func extractMessageData(eventTuple *Tuple) (*MessageData, error) {
 		return nil, fmt.Errorf("missing 'emitter' field in message")
 	}
 
-	emitterBuffer, ok := emitterVal.(*ClarityBuffer)
-	if !ok || emitterBuffer.Length != 32 {
-		return nil, fmt.Errorf("'emitter' field is not a 32-byte buffer: %T", emitterVal)
+	emitterBuffer, ok := emitterVal.(*clarity.Buffer)
+	if !ok || emitterBuffer.Len() != EmitterAddressSize {
+		return nil, fmt.Errorf("'emitter' field is not a %d-byte buffer: %T", EmitterAddressSize, emitterVal)
 	}
 
 	// Convert buffer to wormhole address
@@ -590,7 +639,7 @@ func extractMessageData(eventTuple *Tuple) (*MessageData, error) {
 		return nil, fmt.Errorf("missing 'nonce' field in message")
 	}
 
-	nonceUint, ok := nonceVal.(*UInt128)
+	nonceUint, ok := nonceVal.(*clarity.UInt128)
 	if !ok || nonceUint.Value.Cmp(maxUint32BigInt) > 0 {
 		return nil, fmt.Errorf("invalid 'nonce' field: %T", nonceVal)
 	}
@@ -600,7 +649,7 @@ func extractMessageData(eventTuple *Tuple) (*MessageData, error) {
 		return nil, fmt.Errorf("missing 'sequence' field in message")
 	}
 
-	sequenceUint, ok := sequenceVal.(*UInt128)
+	sequenceUint, ok := sequenceVal.(*clarity.UInt128)
 	if !ok || sequenceUint.Value.Cmp(maxUint64BigInt) > 0 {
 		return nil, fmt.Errorf("invalid 'sequence' field: %T", sequenceVal)
 	}
@@ -610,7 +659,7 @@ func extractMessageData(eventTuple *Tuple) (*MessageData, error) {
 		return nil, fmt.Errorf("missing 'consistency-level' field in message")
 	}
 
-	consistencyLevelUint, ok := consistencyLevelVal.(*UInt128)
+	consistencyLevelUint, ok := consistencyLevelVal.(*clarity.UInt128)
 	if !ok || consistencyLevelUint.Value.Cmp(maxUint8BigInt) > 0 {
 		return nil, fmt.Errorf("invalid 'consistency-level' field: %T", consistencyLevelVal)
 	}
@@ -620,8 +669,8 @@ func extractMessageData(eventTuple *Tuple) (*MessageData, error) {
 		return nil, fmt.Errorf("missing 'payload' field in message")
 	}
 
-	payload, ok := payloadVal.(*ClarityBuffer)
-	if !ok || payload.Length > 8192 {
+	payload, ok := payloadVal.(*clarity.Buffer)
+	if !ok || payload.Len() > MaxPayloadSize {
 		return nil, fmt.Errorf("invalid 'payload' field: %T", payloadVal)
 	}
 
