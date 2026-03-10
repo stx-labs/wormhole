@@ -37,10 +37,10 @@ jobs:
           cache-dependency-path: wormchain/interchaintest/go.sum
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2
 
       - name: Build and export
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
         with:
           context: .
           file: wormchain/Dockerfile.ict
@@ -96,12 +96,15 @@ jobs:
         id: run_test
         continue-on-error: true
         working-directory: wormchain
-        run: make ${{ matrix.test }}
+        run: |
+          export DOCKER_API_VERSION=1.44
+          make ${{ matrix.test }}
 
       - name: Retry Failed Test
         if: steps.run_test.outcome == 'failure'
         working-directory: wormchain
         run: |
+          export DOCKER_API_VERSION=1.44
           for i in 1 2; do
             echo "Retry attempt $i"
             if make ${{ matrix.test }}; then
