@@ -59,7 +59,7 @@ lint(){
     if ! command -v cspell >/dev/null 2>&1; then
         printf "%s\n" "cspell is not installed. Skipping spellcheck"
     else
-        cspell "*/**.*md"
+        cspell "**/*.md"
     fi
     
     # === Go linting
